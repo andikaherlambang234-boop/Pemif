@@ -1,15 +1,67 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PEMIF v22.1 ADAPTIVE INTELLIGENCE ENGINE
+PEMIF v22.3 ADAPTIVE INTELLIGENCE ENGINE — STRUCTURE FIX + AUTO REGIME
++ VISUAL VALIDATOR + FVG ZONE FIX (gabungan satu file)
 ════════════════════════════════════════════════════════════════
-Fix v22.1:
-  - fmt_no_signal_telegram menampilkan FULL info termasuk
-    entry/SL/TP jika order sudah terhitung (order.valid=True)
-  - Pesan scanning tetap informatif dengan semua score
-  - Status bar visual untuk setiap score
-  - Partial signal info saat OFF-KZ
-  - Next KZ countdown lebih detail
+ROOT CAUSE (zero signal / "zonk" 2 hari):
+  raw dict di on_bar_close() HANYA mengisi direction="BUY" statis.
+  Semua field struktur (bos_bull, ob_bull_valid, fvg_bull_fresh,
+  swing_high/low, bias MTF) TIDAK PERNAH dihitung dari bars ->
+  selalu default False/0/NEU -> check_gate() selalu gagal di
+  STRUKTUR HTF / PD ARRAY check -> PendingOrderEngine selalu
+  return valid=False. Hanya arah BUY pernah dicoba, SELL tidak.
+
+FIX v22.2:
+  1. StructureEngine baru: hitung swing high/low, BOS/CHoCH,
+     Order Block, FVG dari buffer M1 -> resample internal jadi
+     M5/M15/M30/H1/H4/D1 (tanpa fetch API tambahan).
+  2. Kedua arah BUY & SELL dievaluasi tiap bar close.
+  3. RegimeAdaptiveMode: auto switch LOOSE<->STRICT.
+  4. Visual Validator (gabungan): jalankan dengan flag --validate
+     untuk plot candlestick + marker swing/BOS/OB dari data LIVE
+     TwelveData, untuk cross-check manual terhadap TradingView.
+     Library plotting (matplotlib/mplfinance/pandas) OPSIONAL —
+     bot utama (mode normal) tetap jalan tanpa library ini.
+
+FIX v22.3 (FVG zone coordinates — silent reject pada setup FVG-only):
+  ROOT CAUSE: detect_fvg() cuma balikin boolean fresh/tidak, gak
+  pernah nyimpen koordinat gap-nya. Signal/PendingOrderEngine sama
+  sekali gak punya field fvg_bull_high/low atau fvg_bear_high/low.
+  Akibatnya kondisi entry di _bull()/_bear() — yang nulis
+  (ob_bull_valid or fvg_bull_fresh) and ob_bull_low > 0 — gagal
+  kalau yang valid CUMA FVG (gak ada OB), karena ob_bull_low tetap
+  default 0.0. Order jatuh ke fallback BOS+liquidity-sweep yang
+  syaratnya lebih ketat (butuh bos_bull True), dan kalau itu juga
+  gagal -> order.valid=False -> check_gate() ke-block di check
+  "order_valid" dengan reason generic "ORDER LEVEL TIDAK VALID"
+  yang gak ngasih clue bahwa akar masalahnya FVG-tanpa-OB. Ini
+  sering terjadi karena detect_order_block() WAJIB bos_bull/bos_bear
+  True sebagai prasyarat sebelum cari OB candle, sedangkan
+  detect_fvg() independen total dari BOS — apalagi di mode LOOSE
+  (FVG_MIN_GAP_ATR_MULT_LOOSE=0.05) gap fresh tanpa BOS itu wajar
+  sering muncul, terutama di awal tren sebelum structure break.
+
+  FIX:
+  1. detect_fvg() sekarang balikin 6 value: fvg_bull, fvg_bear,
+     fvg_bull_high, fvg_bull_low, fvg_bear_high, fvg_bear_low.
+     Koordinat yang diambil adalah gap PALING FRESH (closest ke bar
+     terakhir) untuk masing-masing arah, gak ke-overwrite oleh gap
+     yang lebih lama walau loop tetap scan ke belakang.
+  2. Signal dataclass nambah 4 field baru: fvg_bull_high/low,
+     fvg_bear_high/low — terisi otomatis lewat compute() + setattr
+     loop yang sudah ada, gak perlu ubah apa pun di analyze().
+  3. PendingOrderEngine._bull()/._bear() sekarang punya jalur
+     terpisah: OB valid -> pakai OB (perilaku lama, gak berubah);
+     OB gak valid tapi FVG fresh -> pakai koordinat FVG sebagai
+     entry zone; baru fallback ke BOS+liquidity-sweep breakout kalau
+     dua-duanya gak ada. order_type tetap "BUY/SELL LIMIT" generic
+     (gak dipecah jadi sub-tipe) supaya gak merusak bucket
+     get_stats_by_order_type() di L1 StatisticalLearner.
+  4. Visual Validator: tambah rect FVG Bull (deepskyblue) & FVG Bear
+     (magenta) di _build_markers(), plus baris koordinat FVG di info
+     box dan di _quick_diagnostic() (--diag), supaya fix ini bisa
+     di-cross-check langsung secara visual.
 ════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -18,10 +70,10 @@ import json
 import logging
 import math
 import os
-import queue
+import sys
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone, timedelta, date
 from pathlib import Path
@@ -38,7 +90,6 @@ except ImportError:
 try:
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.preprocessing import StandardScaler
-    from sklearn.model_selection import cross_val_score
     import numpy as np
     ML_AVAILABLE = True
 except ImportError:
@@ -50,13 +101,24 @@ try:
 except ImportError:
     XGB_AVAILABLE = False
 
+# ── Library untuk mode --validate (OPSIONAL, tidak dibutuhkan bot utama) ──
+try:
+    import pandas as pd
+    import mplfinance as mpf
+    import matplotlib.pyplot as plt
+    PLOT_AVAILABLE = True
+except ImportError:
+    PLOT_AVAILABLE = False
+
 __all__ = [
     "Signal", "HistoricalStats", "TradeJournal",
-    "PriceStream", "PendingOrderEngine",
+    "PriceStream", "PendingOrderEngine", "StructureEngine",
+    "RegimeAdaptiveMode",
     "StatisticalLearner", "PatternRecognizer", "MLEngine",
     "AdaptiveController", "KillZoneScheduler",
     "analyze", "fmt_signal_telegram", "fmt_no_signal_telegram",
     "fmt_scanning_telegram", "send_telegram", "run_engine",
+    "run_validator",
 ]
 
 # ═══════════════════════════════════════════════════════════════
@@ -66,7 +128,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
 )
-log = logging.getLogger("PEMIF-v22.1")
+log = logging.getLogger("PEMIF-v22.3")
 
 # ═══════════════════════════════════════════════════════════════
 # CONSTANTS
@@ -111,7 +173,6 @@ MIN_BARS_STC: int = 55
 
 WS_RECONNECT_DELAY: float = 5.0
 REST_POLL_INTERVAL: float = 10.0
-TICK_BUFFER_SIZE:   int   = 500
 
 TELEGRAM_MAX_RETRY:   int   = 3
 TELEGRAM_RETRY_DELAY: float = 1.5
@@ -119,7 +180,7 @@ TELEGRAM_TIMEOUT:     int   = 10
 
 JOURNAL_PATH:  Path = Path("pemif_trade_journal.json")
 PATTERN_PATH:  Path = Path("pemif_patterns.json")
-ADAPTIVE_PATH: Path = Path("pemif_adaptive_params.json")
+REGIME_PATH:   Path = Path("pemif_regime_state.json")
 
 ML_MIN_SAMPLES:   int   = 30
 ML_RETRAIN_EVERY: int   = 10
@@ -133,6 +194,58 @@ KILL_ZONES_NY: Tuple[Dict, ...] = (
     {"name": "NY Open KZ",   "ny_start": (7,  0), "ny_end": (10, 0), "next_day_end": False},
     {"name": "London Close", "ny_start": (10, 0), "ny_end": (12, 0), "next_day_end": False},
 )
+
+# ─────────────────────────────────────────────────────────────
+# STRUCTURE PARAMS (LOOSE vs STRICT)
+# ─────────────────────────────────────────────────────────────
+SWING_LOOKBACK_STRICT:  int = 5
+SWING_LOOKBACK_LOOSE:   int = 2
+
+FVG_MIN_GAP_ATR_MULT_STRICT: float = 0.25
+FVG_MIN_GAP_ATR_MULT_LOOSE:  float = 0.05
+
+FVG_MAX_AGE_BARS_STRICT: int = 15
+FVG_MAX_AGE_BARS_LOOSE:  int = 40
+
+OB_MAX_AGE_BARS_STRICT: int = 20
+OB_MAX_AGE_BARS_LOOSE:  int = 50
+
+BOS_LOOKBACK_BARS: int = 30
+LIQ_SWEEP_LOOKBACK_BARS: int = 20
+
+MTF_TIMEFRAMES: Dict[str, int] = {
+    "m5":  5, "m15": 15, "m30": 30, "h1": 60, "h4": 240, "d1": 1440,
+}
+MTF_BIAS_EMA_FAST_STRICT: int = 20
+MTF_BIAS_EMA_SLOW_STRICT: int = 50
+MTF_BIAS_EMA_FAST_LOOSE:  int = 8
+MTF_BIAS_EMA_SLOW_LOOSE:  int = 21
+MTF_MIN_CANDLES_FOR_BIAS: int = 5
+
+VOL_SURGE_MULT_STRICT: float = 1.8
+VOL_SURGE_MULT_LOOSE:  float = 1.3
+
+# ─────────────────────────────────────────────────────────────
+# REGIME ADAPTIVE MODE PARAMS
+# ─────────────────────────────────────────────────────────────
+REGIME_INITIAL_MODE: str   = "LOOSE"
+REGIME_NO_SIGNAL_BARS_TO_LOOSEN: int   = 40
+REGIME_WINRATE_MIN_TO_TIGHTEN:   float = 45.0
+REGIME_MIN_TRADES_FOR_WINRATE:   int   = 10
+REGIME_HYSTERESIS_BARS:          int   = 5
+
+
+def _resolve_struct_params(mode: str) -> Dict[str, Any]:
+    strict = (mode == "STRICT")
+    return {
+        "swing_lookback":   SWING_LOOKBACK_STRICT if strict else SWING_LOOKBACK_LOOSE,
+        "fvg_min_gap_mult": FVG_MIN_GAP_ATR_MULT_STRICT if strict else FVG_MIN_GAP_ATR_MULT_LOOSE,
+        "fvg_max_age":      FVG_MAX_AGE_BARS_STRICT if strict else FVG_MAX_AGE_BARS_LOOSE,
+        "ob_max_age":       OB_MAX_AGE_BARS_STRICT if strict else OB_MAX_AGE_BARS_LOOSE,
+        "ema_fast":         MTF_BIAS_EMA_FAST_STRICT if strict else MTF_BIAS_EMA_FAST_LOOSE,
+        "ema_slow":         MTF_BIAS_EMA_SLOW_STRICT if strict else MTF_BIAS_EMA_SLOW_LOOSE,
+        "vol_surge_mult":   VOL_SURGE_MULT_STRICT if strict else VOL_SURGE_MULT_LOOSE,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -237,7 +350,6 @@ class KillZoneScheduler:
         return best
 
     def current_kz_remaining(self, now_wib: datetime) -> int:
-        """Menit tersisa dalam Kill Zone aktif. Return 0 jika tidak aktif."""
         offset  = _ny_to_wib_offset(now_wib)
         cur_min = now_wib.hour * 60 + now_wib.minute
         for kz in KILL_ZONES_NY:
@@ -262,6 +374,92 @@ class KillZoneScheduler:
 
 
 kz_scheduler = KillZoneScheduler()
+
+
+# ═══════════════════════════════════════════════════════════════
+# REGIME ADAPTIVE MODE  (auto LOOSE <-> STRICT)
+# ═══════════════════════════════════════════════════════════════
+class RegimeAdaptiveMode:
+    def __init__(self, journal: "TradeJournal", symbol: str, path: Path = REGIME_PATH) -> None:
+        self.journal = journal
+        self.symbol  = symbol
+        self.path    = path
+        self._lock   = threading.Lock()
+        self._no_signal_streak_in_kz: int = 0
+        self._bars_since_switch: int = 0
+        self.mode: str = REGIME_INITIAL_MODE
+        self._load()
+
+    def _load(self) -> None:
+        if self.path.exists():
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                self.mode = d.get("mode", REGIME_INITIAL_MODE)
+                self._no_signal_streak_in_kz = int(d.get("no_signal_streak", 0))
+                self._bars_since_switch = int(d.get("bars_since_switch", 0))
+                log.info("Regime state dimuat: mode=%s", self.mode)
+                return
+            except Exception as e:
+                log.warning("Regime state rusak, reset: %s", e)
+        self.mode = REGIME_INITIAL_MODE
+
+    def _save(self) -> None:
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "mode": self.mode,
+                    "no_signal_streak": self._no_signal_streak_in_kz,
+                    "bars_since_switch": self._bars_since_switch,
+                }, f)
+        except Exception as e:
+            log.warning("Gagal simpan regime state: %s", e)
+
+    def get_mode(self) -> str:
+        with self._lock:
+            return self.mode
+
+    def get_params(self) -> Dict[str, Any]:
+        with self._lock:
+            return _resolve_struct_params(self.mode)
+
+    def on_bar(self, in_killzone: bool, gate_ok: bool) -> Optional[str]:
+        with self._lock:
+            self._bars_since_switch += 1
+
+            if in_killzone:
+                if gate_ok:
+                    self._no_signal_streak_in_kz = 0
+                else:
+                    self._no_signal_streak_in_kz += 1
+
+            switched_to: Optional[str] = None
+            can_switch = self._bars_since_switch >= REGIME_HYSTERESIS_BARS
+
+            if can_switch and self.mode == "STRICT":
+                if self._no_signal_streak_in_kz >= REGIME_NO_SIGNAL_BARS_TO_LOOSEN:
+                    self.mode = "LOOSE"
+                    self._no_signal_streak_in_kz = 0
+                    self._bars_since_switch = 0
+                    switched_to = "LOOSE"
+                    log.warning(
+                        "REGIME SWITCH -> LOOSE (no signal %d bar dalam KZ)",
+                        REGIME_NO_SIGNAL_BARS_TO_LOOSEN,
+                    )
+
+            elif can_switch and self.mode == "LOOSE":
+                stats = self.journal.get_stats(symbol=self.symbol, last_n=REGIME_MIN_TRADES_FOR_WINRATE * 3)
+                if stats.total >= REGIME_MIN_TRADES_FOR_WINRATE and stats.winrate < REGIME_WINRATE_MIN_TO_TIGHTEN:
+                    self.mode = "STRICT"
+                    self._bars_since_switch = 0
+                    switched_to = "STRICT"
+                    log.warning(
+                        "REGIME SWITCH -> STRICT (winrate rolling %.1f%% < %.1f%%, n=%d)",
+                        stats.winrate, REGIME_WINRATE_MIN_TO_TIGHTEN, stats.total,
+                    )
+
+            self._save()
+            return switched_to
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -321,6 +519,7 @@ class Signal:
     gate_ok:     bool  = False
     veto_rsn:    str   = "WAITING"
     grade:       str   = "STANDARD"
+    regime_mode: str   = "LOOSE"
 
     order:    OrderLevels   = field(default_factory=OrderLevels)
     adaptive: AdaptiveParams = field(default_factory=AdaptiveParams)
@@ -337,6 +536,10 @@ class Signal:
     bos_bear:       bool  = False
     fvg_bull_fresh: bool  = False
     fvg_bear_fresh: bool  = False
+    fvg_bull_high:  float = 0.0
+    fvg_bull_low:   float = 0.0
+    fvg_bear_high:  float = 0.0
+    fvg_bear_low:   float = 0.0
     ob_bull_valid:  bool  = False
     ob_bear_valid:  bool  = False
     ob_bull_high:   float = 0.0
@@ -410,7 +613,7 @@ class TradeJournal:
                     return json.load(f)
             except Exception as e:
                 log.warning("Journal rusak, reset: %s", e)
-        return {"trades": [], "version": "22.1"}
+        return {"trades": [], "version": "22.3"}
 
     def _save(self) -> None:
         with open(self.path, "w", encoding="utf-8") as f:
@@ -424,6 +627,7 @@ class TradeJournal:
         indicator_combo: List[str] = None,
         qcm: int = 0, eps: int = 0, cms: float = 0.0,
         market_regime: str = "UNKNOWN",
+        regime_mode: str = "LOOSE",
     ) -> None:
         with self._lock:
             result = "WIN" if tp_hit.startswith("TP") else "LOSS"
@@ -436,6 +640,7 @@ class TradeJournal:
                 "indicator_combo": sorted(indicator_combo or []),
                 "qcm": qcm, "eps": eps, "cms": cms,
                 "market_regime": market_regime,
+                "regime_mode": regime_mode,
                 "timestamp": datetime.now(WIB).isoformat(),
             }
             self._data["trades"].append(trade)
@@ -490,6 +695,260 @@ class TradeJournal:
             winrate=round(len(wins) / total * 100, 1),
             avg_rr=round(sum(win_rrs) / len(win_rrs), 2) if win_rrs else 0.0,
         )
+
+
+# ═══════════════════════════════════════════════════════════════
+# STRUCTURE ENGINE  (FIX UTAMA — root cause "zonk")
+# ═══════════════════════════════════════════════════════════════
+class StructureEngine:
+    def __init__(self) -> None:
+        pass
+
+    @staticmethod
+    def resample(bars_m1: List[Dict], bars_per_candle: int) -> List[Dict]:
+        if bars_per_candle <= 1 or len(bars_m1) < bars_per_candle:
+            return bars_m1
+        out: List[Dict] = []
+        n = len(bars_m1)
+        start = n % bars_per_candle
+        chunk_iter = bars_m1[start:] if start else bars_m1
+        for i in range(0, len(chunk_iter), bars_per_candle):
+            chunk = chunk_iter[i:i + bars_per_candle]
+            if len(chunk) < bars_per_candle:
+                continue
+            out.append({
+                "open":  chunk[0]["open"],
+                "high":  max(c["high"] for c in chunk),
+                "low":   min(c["low"] for c in chunk),
+                "close": chunk[-1]["close"],
+                "volume": sum(c.get("volume", 0.0) for c in chunk),
+                "datetime": chunk[-1].get("datetime", ""),
+            })
+        return out
+
+    @staticmethod
+    def find_swings(bars: List[Dict], lookback: int) -> Tuple[float, float]:
+        n = len(bars)
+        if n < (2 * lookback + 1):
+            return 0.0, 0.0
+        highs = [b["high"] for b in bars]
+        lows  = [b["low"]  for b in bars]
+        swing_high = 0.0
+        swing_low  = 0.0
+        for i in range(n - lookback - 1, lookback - 1, -1):
+            window_h = highs[i - lookback: i + lookback + 1]
+            if highs[i] == max(window_h) and swing_high == 0.0:
+                swing_high = highs[i]
+            window_l = lows[i - lookback: i + lookback + 1]
+            if lows[i] == min(window_l) and swing_low == 0.0:
+                swing_low = lows[i]
+            if swing_high and swing_low:
+                break
+        return swing_high, swing_low
+
+    @staticmethod
+    def detect_bos(bars: List[Dict], swing_high: float, swing_low: float,
+                    lookback_bars: int) -> Tuple[bool, bool]:
+        if len(bars) < 3 or (swing_high == 0.0 and swing_low == 0.0):
+            return False, False
+        recent = bars[-lookback_bars:] if len(bars) >= lookback_bars else bars
+        closes = [b["close"] for b in recent]
+        bos_bull = swing_high > 0 and any(c > swing_high for c in closes)
+        bos_bear = swing_low  > 0 and any(c < swing_low  for c in closes)
+        return bos_bull, bos_bear
+
+    @staticmethod
+    def detect_liq_sweep(bars: List[Dict], swing_high: float, swing_low: float,
+                          lookback_bars: int) -> Tuple[bool, bool]:
+        if len(bars) < 2:
+            return False, False
+        recent = bars[-lookback_bars:] if len(bars) >= lookback_bars else bars
+        swept_h = False
+        swept_l = False
+        for b in recent:
+            if swing_high > 0 and b["high"] > swing_high and b["close"] < swing_high:
+                swept_h = True
+            if swing_low > 0 and b["low"] < swing_low and b["close"] > swing_low:
+                swept_l = True
+        return swept_l, swept_h
+
+    @staticmethod
+    def detect_order_block(bars: List[Dict], bos_bull: bool, bos_bear: bool,
+                            max_age: int) -> Tuple[bool, bool, float, float, float, float]:
+        n = len(bars)
+        if n < 5:
+            return False, False, 0.0, 0.0, 0.0, 0.0
+        window = bars[-max_age:] if n >= max_age else bars
+
+        ob_bull_valid = False
+        ob_bull_high = ob_bull_low = 0.0
+        if bos_bull:
+            for i in range(len(window) - 2, 0, -1):
+                c = window[i]
+                if c["close"] < c["open"]:
+                    ob_bull_high = c["high"]
+                    ob_bull_low  = c["low"]
+                    ob_bull_valid = True
+                    break
+
+        ob_bear_valid = False
+        ob_bear_high = ob_bear_low = 0.0
+        if bos_bear:
+            for i in range(len(window) - 2, 0, -1):
+                c = window[i]
+                if c["close"] > c["open"]:
+                    ob_bear_high = c["high"]
+                    ob_bear_low  = c["low"]
+                    ob_bear_valid = True
+                    break
+
+        return ob_bull_valid, ob_bear_valid, ob_bull_high, ob_bull_low, ob_bear_high, ob_bear_low
+
+    @staticmethod
+    def detect_fvg(bars: List[Dict], atr: float, min_gap_mult: float,
+                    max_age: int) -> Tuple[bool, bool, float, float, float, float]:
+        """
+        FIX v22.3: sekarang balikin koordinat zona gap juga, gak cuma boolean.
+        Loop scan dari bar paling baru ke lama (i menurun). Begitu gap valid
+        pertama kali ketemu untuk satu arah, koordinatnya di-lock (gak
+        ke-overwrite oleh gap yang lebih lama) — itu sebabnya guard
+        `and not fvg_bull` / `and not fvg_bear` ditambahkan di kondisinya.
+        fvg_*_high selalu > fvg_*_low secara konstruksi (gap_up/gap_dn
+        dihitung sebagai selisih positif).
+        """
+        n = len(bars)
+        if n < 3 or atr <= 0:
+            return False, False, 0.0, 0.0, 0.0, 0.0
+        min_gap = atr * min_gap_mult
+        window = bars[-max_age:] if n >= max_age else bars
+        fvg_bull = False
+        fvg_bear = False
+        fvg_bull_high = fvg_bull_low = 0.0
+        fvg_bear_high = fvg_bear_low = 0.0
+        for i in range(len(window) - 1, 1, -1):
+            c0, c1, c2 = window[i - 2], window[i - 1], window[i]
+            gap_up = c2["low"] - c0["high"]
+            if gap_up > min_gap and not fvg_bull:
+                fvg_bull = True
+                fvg_bull_high = c2["low"]
+                fvg_bull_low  = c0["high"]
+            gap_dn = c0["low"] - c2["high"]
+            if gap_dn > min_gap and not fvg_bear:
+                fvg_bear = True
+                fvg_bear_high = c0["low"]
+                fvg_bear_low  = c2["high"]
+            if fvg_bull and fvg_bear:
+                break
+        return fvg_bull, fvg_bear, fvg_bull_high, fvg_bull_low, fvg_bear_high, fvg_bear_low
+
+    @staticmethod
+    def calc_bias(bars_tf: List[Dict], ema_fast: int, ema_slow: int) -> str:
+        if len(bars_tf) < max(MTF_MIN_CANDLES_FOR_BIAS, 2):
+            return "NEU"
+        closes = [b["close"] for b in bars_tf]
+        if len(closes) < ema_slow:
+            ema_slow = max(2, len(closes) - 1)
+            ema_fast = max(1, ema_slow // 2)
+        ef = StructureEngine._ema(closes, ema_fast)
+        es = StructureEngine._ema(closes, ema_slow)
+        if ef[-1] > es[-1]:
+            return "BUL"
+        if ef[-1] < es[-1]:
+            return "BER"
+        return "NEU"
+
+    @staticmethod
+    def _ema(data: List[float], period: int) -> List[float]:
+        if not data:
+            return [0.0]
+        period = max(1, min(period, len(data)))
+        k = 2.0 / (period + 1)
+        result = [0.0] * len(data)
+        seed_end = min(period, len(data))
+        result[seed_end - 1] = sum(data[:seed_end]) / seed_end
+        for i in range(seed_end, len(data)):
+            result[i] = data[i] * k + result[i - 1] * (1.0 - k)
+        for i in range(seed_end - 1):
+            result[i] = result[seed_end - 1]
+        return result
+
+    @staticmethod
+    def detect_vol_surge(bars: List[Dict], mult: float) -> bool:
+        if len(bars) < 21:
+            return False
+        vols = [b.get("volume", 0.0) for b in bars[-21:]]
+        avg  = sum(vols[:-1]) / 20 if len(vols) >= 21 else 0.0
+        return avg > 0 and vols[-1] > avg * mult
+
+    @staticmethod
+    def detect_chop(bars: List[Dict], atr: float) -> bool:
+        if len(bars) < 10 or atr <= 0:
+            return False
+        last10 = bars[-10:]
+        rng = max(b["high"] for b in last10) - min(b["low"] for b in last10)
+        return rng < atr * 1.2
+
+    @staticmethod
+    def detect_displacement(bars: List[Dict], atr: float) -> bool:
+        if len(bars) < 2 or atr <= 0:
+            return False
+        last = bars[-1]
+        body = abs(last["close"] - last["open"])
+        return body > atr * 0.8
+
+    def compute(self, bars_m1: List[Dict], direction_hint: str,
+                atr: float, params: Dict[str, Any]) -> Dict[str, Any]:
+        swing_high, swing_low = self.find_swings(bars_m1, params["swing_lookback"])
+        bos_bull, bos_bear = self.detect_bos(bars_m1, swing_high, swing_low, BOS_LOOKBACK_BARS)
+        liq_swept_l, liq_swept_h = self.detect_liq_sweep(
+            bars_m1, swing_high, swing_low, LIQ_SWEEP_LOOKBACK_BARS)
+        (ob_bull_valid, ob_bear_valid, ob_bull_high, ob_bull_low,
+         ob_bear_high, ob_bear_low) = self.detect_order_block(
+            bars_m1, bos_bull, bos_bear, params["ob_max_age"])
+        (fvg_bull_fresh, fvg_bear_fresh, fvg_bull_high, fvg_bull_low,
+         fvg_bear_high, fvg_bear_low) = self.detect_fvg(
+            bars_m1, atr, params["fvg_min_gap_mult"], params["fvg_max_age"])
+
+        biases: Dict[str, str] = {}
+        for tf_name, bars_per_candle in MTF_TIMEFRAMES.items():
+            tf_bars = self.resample(bars_m1, bars_per_candle)
+            biases[tf_name] = self.calc_bias(tf_bars, params["ema_fast"], params["ema_slow"])
+
+        vol_surge = self.detect_vol_surge(bars_m1, params["vol_surge_mult"])
+        acf_chop  = self.detect_chop(bars_m1, atr)
+        disp_ok   = self.detect_displacement(bars_m1, atr)
+
+        sfp_signal = "NO"
+        if liq_swept_l:
+            sfp_signal = "BULL"
+        elif liq_swept_h:
+            sfp_signal = "BEAR"
+
+        pd_priority = 5 if (ob_bull_valid or ob_bear_valid) else 15
+
+        return {
+            "swing_high": round(swing_high, 2), "swing_low": round(swing_low, 2),
+            "bos_bull": bos_bull, "bos_bear": bos_bear,
+            "liq_swept_l": liq_swept_l, "liq_swept_h": liq_swept_h,
+            "ob_bull_valid": ob_bull_valid, "ob_bear_valid": ob_bear_valid,
+            "ob_bull_high": round(ob_bull_high, 2), "ob_bull_low": round(ob_bull_low, 2),
+            "ob_bear_high": round(ob_bear_high, 2), "ob_bear_low": round(ob_bear_low, 2),
+            "fvg_bull_fresh": fvg_bull_fresh, "fvg_bear_fresh": fvg_bear_fresh,
+            "fvg_bull_high": round(fvg_bull_high, 2), "fvg_bull_low": round(fvg_bull_low, 2),
+            "fvg_bear_high": round(fvg_bear_high, 2), "fvg_bear_low": round(fvg_bear_low, 2),
+            "m5_bias": biases["m5"], "m15_bias": biases["m15"], "m30_bias": biases["m30"],
+            "h1_bias": biases["h1"], "h4_bias": biases["h4"], "d1_bias": biases["d1"],
+            "m1_bias": "BUL" if bars_m1[-1]["close"] > bars_m1[-2]["close"] else "BER" if len(bars_m1) >= 2 else "NEU",
+            "vol_surge": vol_surge, "acf_chop": acf_chop, "disp_ok": disp_ok,
+            "sfp_signal": sfp_signal, "pd_priority": pd_priority,
+            "pd_type": "OB" if (ob_bull_valid or ob_bear_valid) else ("FVG" if (fvg_bull_fresh or fvg_bear_fresh) else "-"),
+            "fractal_conv": sum([bos_bull or bos_bear, ob_bull_valid or ob_bear_valid,
+                                  fvg_bull_fresh or fvg_bear_fresh, liq_swept_l or liq_swept_h]),
+            "harmonic_pcz": False,
+        }
+
+
+structure_engine = StructureEngine()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -819,6 +1278,7 @@ class AdaptiveController:
             indicator_combo=active_inds,
             qcm=sig.qcm_score, eps=sig.eps_score, cms=sig.cms_score,
             market_regime="RANGING" if sig.is_ranging else "TRENDING",
+            regime_mode=sig.regime_mode,
         )
         self.pat_recog.train()
         self.ml_engine.maybe_retrain()
@@ -885,7 +1345,7 @@ def calc_cms(bars: List[Dict], direction: str) -> Dict:
     gamma = LAGUERRE_GAMMA
     L0=L1=L2=L3=closes[0]
     for c in closes:
-        nL0=-gamma*L0+c*(1-gamma)+(gamma*L0);  nL0=(1-gamma)*c+gamma*L0
+        nL0=(1-gamma)*c+gamma*L0
         nL1=-gamma*nL0+L0+gamma*L1
         nL2=-gamma*nL1+L1+gamma*L2
         nL3=-gamma*nL2+L2+gamma*L3
@@ -931,18 +1391,26 @@ class PendingOrderEngine:
         return self._bull(sig) if sig.direction=="BUY" else self._bear(sig)
 
     def _bull(self, sig: Signal) -> OrderLevels:
-        if (sig.ob_bull_valid or sig.fvg_bull_fresh) and sig.ob_bull_low>0:
+        # OB tetap prioritas utama — perilaku lama, gak berubah.
+        if sig.ob_bull_valid and sig.ob_bull_low > 0:
             return self._limit("BUY", sig.ob_bull_high, sig.ob_bull_low, sig.swing_low,
-                f"BUY LIMIT di OB/FVG [{sig.ob_bull_low:.2f}–{sig.ob_bull_high:.2f}]")
+                f"BUY LIMIT di OB [{sig.ob_bull_low:.2f}–{sig.ob_bull_high:.2f}]")
+        # FIX v22.3: FVG-only sekarang punya koordinat zona sendiri.
+        if sig.fvg_bull_fresh and sig.fvg_bull_low > 0:
+            return self._limit("BUY", sig.fvg_bull_high, sig.fvg_bull_low, sig.swing_low,
+                f"BUY LIMIT di FVG [{sig.fvg_bull_low:.2f}–{sig.fvg_bull_high:.2f}]")
         if sig.swing_high>0 and sig.bos_bull and sig.liq_swept_l:
             return self._stop("BUY", sig.swing_high, sig.swing_low,
                 f"BUY STOP breakout [{sig.swing_high:.2f}]")
         return OrderLevels(reason="Tidak ada zona BUY valid", valid=False)
 
     def _bear(self, sig: Signal) -> OrderLevels:
-        if (sig.ob_bear_valid or sig.fvg_bear_fresh) and sig.ob_bear_high>0:
+        if sig.ob_bear_valid and sig.ob_bear_high > 0:
             return self._limit("SELL", sig.ob_bear_high, sig.ob_bear_low, sig.swing_high,
-                f"SELL LIMIT di OB/FVG [{sig.ob_bear_low:.2f}–{sig.ob_bear_high:.2f}]")
+                f"SELL LIMIT di OB [{sig.ob_bear_low:.2f}–{sig.ob_bear_high:.2f}]")
+        if sig.fvg_bear_fresh and sig.fvg_bear_high > 0:
+            return self._limit("SELL", sig.fvg_bear_high, sig.fvg_bear_low, sig.swing_high,
+                f"SELL LIMIT di FVG [{sig.fvg_bear_low:.2f}–{sig.fvg_bear_high:.2f}]")
         if sig.swing_low>0 and sig.bos_bear and sig.liq_swept_h:
             return self._stop("SELL", sig.swing_low, sig.swing_high,
                 f"SELL STOP breakdown [{sig.swing_low:.2f}]")
@@ -1094,29 +1562,35 @@ def _validate_raw(raw: Dict) -> Dict:
 def analyze(
     raw: Dict, bars: List[Dict], symbol: str,
     adaptive: Optional[AdaptiveController] = None,
+    regime: Optional[RegimeAdaptiveMode] = None,
 ) -> Signal:
     raw = _validate_raw(raw)
     sig = Signal()
 
-    for fn in (
-        "direction","d1_bias","h4_bias","h1_bias","m30_bias","m15_bias","m5_bias","m1_bias",
-        "bos_bull","bos_bear","fvg_bull_fresh","fvg_bear_fresh",
-        "ob_bull_valid","ob_bear_valid",
-        "ob_bull_high","ob_bull_low","ob_bear_high","ob_bear_low",
-        "swing_high","swing_low","liq_swept_l","liq_swept_h",
-        "disp_ok","sfp_signal","vol_surge","acf_chop","pdc_ok",
-        "pd_type","pd_priority","fractal_conv","harmonic_pcz",
-        "news_ok","news_tier","current_price",
-    ):
-        if fn in raw: setattr(sig, fn, raw[fn])
+    direction = raw.get("direction", "BUY")
+    sig.direction = direction
 
     now_wib=datetime.now(WIB)
     sig.in_killzone, sig.kz_name, sig.kz_start, sig.kz_end = kz_scheduler.check(now_wib)
 
+    mode = regime.get_mode() if regime is not None else REGIME_INITIAL_MODE
+    sig.regime_mode = mode
+    struct_params = _resolve_struct_params(mode)
+
+    atr_now = calc_atr_rma(bars, ATR_PERIOD)
+
+    struct = structure_engine.compute(bars, direction, atr_now, struct_params)
+    for k, v in struct.items():
+        setattr(sig, k, v)
+
+    for fn in ("news_ok", "news_tier", "current_price"):
+        if fn in raw:
+            setattr(sig, fn, raw[fn])
+
     cme=calc_cms(bars, sig.direction)
     sig.ttm_fire=cme["ttm_fire"]; sig.lrsi_ok=cme["lrsi_ok"]
     sig.fisher_ok=cme["fisher_ok"]; sig.stc_ok=cme["stc_ok"]
-    sig.cms_score=cme["cms_score"]; sig.atr_current=cme["atr"]
+    sig.cms_score=cme["cms_score"]; sig.atr_current=cme["atr"] or atr_now
 
     snap=asdict(sig); eps=calc_eps(snap)
     sig.eps_layer1_structure=eps["eps_layer1_structure"]
@@ -1181,11 +1655,31 @@ def analyze(
     return sig
 
 
+def analyze_both_directions(
+    bars: List[Dict], symbol: str,
+    adaptive: Optional[AdaptiveController] = None,
+    regime: Optional[RegimeAdaptiveMode] = None,
+    news_ok: bool = True, news_tier: int = 0,
+) -> Signal:
+    price = bars[-1]["close"] if bars else 0.0
+    base_raw = {"current_price": price, "news_ok": news_ok, "news_tier": news_tier}
+
+    sig_buy  = analyze({**base_raw, "direction": "BUY"},  bars, symbol, adaptive, regime)
+    sig_sell = analyze({**base_raw, "direction": "SELL"}, bars, symbol, adaptive, regime)
+
+    if sig_buy.gate_ok and not sig_sell.gate_ok:
+        return sig_buy
+    if sig_sell.gate_ok and not sig_buy.gate_ok:
+        return sig_sell
+    if sig_buy.gate_ok and sig_sell.gate_ok:
+        return sig_buy if sig_buy.qcm_score >= sig_sell.qcm_score else sig_sell
+    return sig_buy if sig_buy.qcm_score >= sig_sell.qcm_score else sig_sell
+
+
 # ═══════════════════════════════════════════════════════════════
 # VISUAL HELPERS
 # ═══════════════════════════════════════════════════════════════
 def _bar(value: float, max_val: float, width: int = 10) -> str:
-    """Progress bar visual. Contoh: [████████░░] 8/10"""
     filled = int(round(value / max_val * width)) if max_val > 0 else 0
     filled = max(0, min(filled, width))
     return "█" * filled + "░" * (width - filled)
@@ -1203,7 +1697,6 @@ def _conf(eps, sqs, ctx, soft) -> int:
     )
 
 def _cme_line(sig: Signal) -> str:
-    """Format baris CME indikator."""
     def chk(ok): return "✅" if ok else "❌"
     return (
         f"{chk(sig.ttm_fire)} TTM Squeeze\n"
@@ -1238,7 +1731,6 @@ def _bias_table(sig: Signal) -> str:
     ])
 
 def _order_block(o: OrderLevels, d: str) -> str:
-    """Format blok entry/SL/TP lengkap."""
     if not o.valid:
         return f"⚠️ {o.reason}"
     d_icon = _dir_icon(d)
@@ -1267,10 +1759,8 @@ def fmt_signal_telegram(sig: Signal, symbol: str, stats: HistoricalStats) -> str
     aligned = sum(1 for b in biases if b==tb)
     conf    = _conf(sig.eps_score, sig.sqs_score, sig.ctx_score, sig.soft_count)
 
-    # Confidence bar
     conf_bar = _bar(conf, 100, 10)
 
-    # Adaptive block
     adapt_lines = []
     p = sig.adaptive
     if p.ranging_boost_active:
@@ -1280,9 +1770,9 @@ def fmt_signal_telegram(sig: Signal, symbol: str, stats: HistoricalStats) -> str
         adapt_lines.append(f"🤖 ML Prob : [{ml_bar}] {sig.ml_win_prob:.0%}")
     if sig.pattern_bonus > 0:
         adapt_lines.append(f"🔮 Pattern Bonus: +{sig.pattern_bonus:.2f} CMS")
+    adapt_lines.append(f"⚙️ Regime Mode : {sig.regime_mode}")
     adapt_str = "\n".join(adapt_lines) if adapt_lines else "—"
 
-    # KZ remaining
     remaining = kz_scheduler.current_kz_remaining(datetime.now(WIB))
 
     SEP = "═" * 33
@@ -1342,7 +1832,7 @@ def fmt_signal_telegram(sig: Signal, symbol: str, stats: HistoricalStats) -> str
 
         f"{SEP}\n"
         f"🕒 {now_wib}\n"
-        f"<i>PEMIF v22.1 Adaptive Intelligence</i>\n"
+        f"<i>PEMIF v22.3 Adaptive Intelligence</i>\n"
         f"{SEP}"
     )
 
@@ -1351,16 +1841,12 @@ def fmt_signal_telegram(sig: Signal, symbol: str, stats: HistoricalStats) -> str
 # FORMATTER 2 — SCANNING / NO SIGNAL (gate_ok=False, in KZ)
 # ═══════════════════════════════════════════════════════════════
 def fmt_scanning_telegram(sig: Signal, symbol: str) -> str:
-    """Pesan saat dalam Kill Zone tapi sinyal belum memenuhi syarat.
-    Tetap tampilkan semua score + entry level jika sudah terhitung.
-    """
     now_wib   = datetime.now(WIB).strftime("%H:%M WIB")
     conf      = _conf(sig.eps_score, sig.sqs_score, sig.ctx_score, sig.soft_count)
     remaining = kz_scheduler.current_kz_remaining(datetime.now(WIB))
 
     SEP = "─" * 33
 
-    # Blok order — tampilkan meski gate belum OK
     if sig.order.valid:
         order_str = (
             f"\n{SEP}\n\n"
@@ -1375,18 +1861,18 @@ def fmt_scanning_telegram(sig: Signal, symbol: str) -> str:
             f"⚠️ Order level belum valid: {sig.order.reason}\n"
         )
 
-    # ML prob bar
     ml_str = ""
     if sig.ml_active and sig.ml_win_prob > 0:
         ml_bar = _bar(sig.ml_win_prob, 1.0, 10)
         ml_str = f"\n🤖 ML Prob   : [{ml_bar}] {sig.ml_win_prob:.0%}"
 
     return (
-        f"⏳ <b>SCANNING</b> | {symbol} | {now_wib}\n\n"
+        f"⏳ <b>SCANNING</b> | {symbol} | {now_wib} | Arah dicek: {sig.direction}\n\n"
 
         f"⏰ Kill Zone : <b>{sig.kz_name}</b>\n"
         f"   Window   : {sig.kz_start}–{sig.kz_end} WIB\n"
-        f"   Sisa     : ±{remaining} menit\n\n"
+        f"   Sisa     : ±{remaining} menit\n"
+        f"   Regime   : {sig.regime_mode}\n\n"
 
         f"{SEP}\n\n"
 
@@ -1429,7 +1915,6 @@ def fmt_scanning_telegram(sig: Signal, symbol: str) -> str:
 # FORMATTER 3 — OFF KILL ZONE
 # ═══════════════════════════════════════════════════════════════
 def fmt_no_signal_telegram(sig: Signal, symbol: str) -> str:
-    """Pesan saat di luar Kill Zone. Compact tapi tetap informatif."""
     now_wib = datetime.now(WIB).strftime("%H:%M WIB")
     nxt     = kz_scheduler.next_killzone(datetime.now(WIB))
     conf    = _conf(sig.eps_score, sig.sqs_score, sig.ctx_score, sig.soft_count)
@@ -1445,7 +1930,6 @@ def fmt_no_signal_telegram(sig: Signal, symbol: str) -> str:
             f"   Dalam : {countdown}\n"
         )
 
-    # Pre-calculated order jika ada
     order_str = ""
     if sig.order.valid:
         order_str = (
@@ -1459,12 +1943,12 @@ def fmt_no_signal_telegram(sig: Signal, symbol: str) -> str:
     dst_tag     = now_windows[0]["dst"] if now_windows else "?"
 
     return (
-        f"🤖 <b>PEMIF v22.1</b> | {symbol} | {now_wib}\n"
-        f"Status : OFF Kill Zone ({dst_tag})\n\n"
+        f"🤖 <b>PEMIF v22.3</b> | {symbol} | {now_wib}\n"
+        f"Status : OFF Kill Zone ({dst_tag}) | Regime: {sig.regime_mode}\n\n"
 
         f"─────────────────────────────────\n\n"
 
-        f"📊 Score Terakhir\n\n"
+        f"📊 Score Terakhir ({sig.direction})\n\n"
         f"EPS : {sig.eps_score}/{MAX_EPS}  QCM : {sig.qcm_score}/{MAX_QCM}\n"
         f"CMS : [{_bar(sig.cms_score,10)}] {sig.cms_score:.1f}/10\n"
         f"Confidence : {conf}%\n\n"
@@ -1488,6 +1972,19 @@ def fmt_kz_schedule(now_wib: datetime) -> str:
         active = " ← AKTIF" if (in_kz and w["name"]==kz_name) else ""
         lines.append(f"  🕐 {w['name']}: {w['start']} – {w['end']}{active}")
     return "\n".join(lines)
+
+
+def fmt_regime_switch_telegram(new_mode: str, symbol: str) -> str:
+    icon = "🔓 LOOSE" if new_mode == "LOOSE" else "🔒 STRICT"
+    reason = ("terlalu lama tanpa sinyal valid dalam Kill Zone"
+              if new_mode == "LOOSE" else
+              "winrate rolling jatuh di bawah ambang saat mode LOOSE")
+    return (
+        f"⚙️ <b>REGIME AUTO-SWITCH</b> | {symbol}\n\n"
+        f"Mode baru : <b>{icon}</b>\n"
+        f"Alasan    : {reason}\n"
+        f"🕒 {datetime.now(WIB).strftime('%d %b %Y | %H:%M WIB')}"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1653,68 +2150,63 @@ def run_engine(
     interval: str = INTERVAL,
     journal:  Optional[TradeJournal]       = None,
     adaptive: Optional[AdaptiveController] = None,
+    regime:   Optional[RegimeAdaptiveMode] = None,
 ) -> None:
     if journal  is None: journal  = TradeJournal()
     if adaptive is None: adaptive = AdaptiveController(journal, symbol)
+    if regime   is None: regime   = RegimeAdaptiveMode(journal, symbol)
 
-    log.info("PEMIF v22.1 starting: %s @ %s", symbol, interval)
+    log.info("PEMIF v22.3 starting: %s @ %s | Regime awal=%s", symbol, interval, regime.get_mode())
 
-    # Kirim jadwal KZ saat startup
     send_telegram(fmt_kz_schedule(datetime.now(WIB)))
+    send_telegram(f"🚀 PEMIF v22.3 aktif. Regime mode awal: <b>{regime.get_mode()}</b>")
 
     _last_kz_hour  = {"h": -1}
-    # Throttle scanning msg: kirim max 1x per N bar
     _scan_counter  = {"n": 0}
-    SCAN_MSG_EVERY = 5   # kirim scanning msg setiap 5 bar dalam KZ
+    SCAN_MSG_EVERY = 5
 
     def on_bar_close(bars: List[Dict]) -> None:
         try:
             now    = datetime.now(WIB)
             stats  = journal.get_stats(symbol=symbol, last_n=100)
-            price  = bars[-1]["close"] if bars else 0.0
 
-            raw: Dict = {
-                "direction":     "BUY",
-                "current_price": price,
-                "news_ok":       True,
-                "news_tier":     0,
-            }
+            sig = analyze_both_directions(
+                bars, symbol, adaptive=adaptive, regime=regime,
+                news_ok=True, news_tier=0,
+            )
 
-            sig = analyze(raw, bars, symbol, adaptive=adaptive)
+            switched = regime.on_bar(in_killzone=sig.in_killzone, gate_ok=sig.gate_ok)
+            if switched:
+                send_telegram(fmt_regime_switch_telegram(switched, symbol))
 
-            # Kirim jadwal KZ tiap jam baru
             if now.hour != _last_kz_hour["h"]:
                 _last_kz_hour["h"] = now.hour
                 send_telegram(fmt_kz_schedule(now))
 
             if sig.gate_ok and sig.order.valid:
-                # ── HIGH PROBABILITY SIGNAL ──────────────────
                 msg = fmt_signal_telegram(sig, symbol, stats)
-                log.info("SIGNAL %s %s entry=%.2f ML=%.0f%%",
+                log.info("SIGNAL %s %s entry=%.2f ML=%.0f%% mode=%s",
                          sig.direction, sig.order.order_type,
-                         sig.order.entry, sig.ml_win_prob*100)
+                         sig.order.entry, sig.ml_win_prob*100, sig.regime_mode)
                 send_telegram(msg)
                 _scan_counter["n"] = 0
 
             elif sig.in_killzone:
-                # ── SCANNING dalam KZ ────────────────────────
                 _scan_counter["n"] += 1
                 if _scan_counter["n"] >= SCAN_MSG_EVERY:
                     msg = fmt_scanning_telegram(sig, symbol)
-                    log.info("Scanning: %s EPS=%d QCM=%d CMS=%.1f",
+                    log.info("Scanning: %s EPS=%d QCM=%d CMS=%.1f mode=%s",
                              sig.veto_rsn, sig.eps_score,
-                             sig.qcm_score, sig.cms_score)
+                             sig.qcm_score, sig.cms_score, sig.regime_mode)
                     send_telegram(msg)
                     _scan_counter["n"] = 0
                 else:
-                    log.info("KZ scanning [%d/%d]: %s EPS=%d QCM=%d",
+                    log.info("KZ scanning [%d/%d]: %s EPS=%d QCM=%d mode=%s",
                              _scan_counter["n"], SCAN_MSG_EVERY,
-                             sig.veto_rsn, sig.eps_score, sig.qcm_score)
+                             sig.veto_rsn, sig.eps_score, sig.qcm_score, sig.regime_mode)
 
             else:
-                # ── OFF Kill Zone ────────────────────────────
-                log.info("OFF-KZ: %s", sig.veto_rsn)
-                # Kirim off-kz update setiap 30 bar (tidak spam)
+                log.info("OFF-KZ: %s mode=%s", sig.veto_rsn, sig.regime_mode)
                 if _scan_counter["n"] % 30 == 0:
                     send_telegram(fmt_no_signal_telegram(sig, symbol))
                 _scan_counter["n"] += 1
@@ -1733,11 +2225,281 @@ def run_engine(
         log.info("Shutdown.")
     finally:
         stream.stop()
-        log.info("PEMIF v22.1 stopped.")
+        log.info("PEMIF v22.3 stopped.")
+
+
+# ═══════════════════════════════════════════════════════════════
+# VISUAL VALIDATOR  (mode --validate, butuh matplotlib/mplfinance/pandas)
+# ═══════════════════════════════════════════════════════════════
+def _fetch_bars_rest(symbol: str, interval: str, api_key: str, outputsize: int) -> List[Dict]:
+    """Fetch bar via REST — sama persis dengan PriceStream._fetch_initial(),
+    dipakai khusus oleh validator agar tidak perlu start WebSocket/thread."""
+    if not api_key:
+        print("❌ TWELVEDATA_KEY tidak di-set di environment variable.")
+        sys.exit(1)
+    r = requests.get(
+        "https://api.twelvedata.com/time_series",
+        params={
+            "symbol": symbol, "interval": interval,
+            "outputsize": outputsize, "apikey": api_key, "order": "ASC",
+        },
+        timeout=15,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if "values" not in data:
+        print(f"❌ Response API tidak ada 'values'. Isi response: {data}")
+        sys.exit(1)
+    bars = []
+    for v in data["values"]:
+        bars.append({
+            "open":  float(v["open"]),
+            "high":  float(v["high"]),
+            "low":   float(v["low"]),
+            "close": float(v["close"]),
+            "volume": float(v.get("volume", 0) or 0),
+            "datetime": v["datetime"],
+        })
+    return bars
+
+
+def _bars_to_df(bars: List[Dict]):
+    df = pd.DataFrame(bars)
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df.set_index("datetime", inplace=True)
+    df = df.rename(columns={
+        "open": "Open", "high": "High", "low": "Low",
+        "close": "Close", "volume": "Volume",
+    })
+    return df[["Open", "High", "Low", "Close", "Volume"]]
+
+
+def _build_markers(struct: Dict) -> Dict:
+    markers = {
+        "hlines": [], "hline_colors": [], "hline_styles": [], "hline_labels": [],
+        "rects": [],
+    }
+    if struct["swing_high"] > 0:
+        markers["hlines"].append(struct["swing_high"])
+        markers["hline_colors"].append("orange")
+        markers["hline_styles"].append("--")
+        markers["hline_labels"].append(f"Swing High {struct['swing_high']:.2f}")
+
+    if struct["swing_low"] > 0:
+        markers["hlines"].append(struct["swing_low"])
+        markers["hline_colors"].append("blue")
+        markers["hline_styles"].append("--")
+        markers["hline_labels"].append(f"Swing Low {struct['swing_low']:.2f}")
+
+    if struct["ob_bull_valid"] and struct["ob_bull_low"] > 0:
+        markers["rects"].append({
+            "y0": struct["ob_bull_low"], "y1": struct["ob_bull_high"],
+            "color": "green", "alpha": 0.18,
+            "label": f"OB Bull [{struct['ob_bull_low']:.2f}-{struct['ob_bull_high']:.2f}]",
+        })
+
+    if struct["ob_bear_valid"] and struct["ob_bear_high"] > 0:
+        markers["rects"].append({
+            "y0": struct["ob_bear_low"], "y1": struct["ob_bear_high"],
+            "color": "red", "alpha": 0.18,
+            "label": f"OB Bear [{struct['ob_bear_low']:.2f}-{struct['ob_bear_high']:.2f}]",
+        })
+
+    # FIX v22.3: zona FVG digambar juga, warna beda dari OB biar gak rancu.
+    if struct["fvg_bull_fresh"] and struct["fvg_bull_high"] > 0:
+        markers["rects"].append({
+            "y0": struct["fvg_bull_low"], "y1": struct["fvg_bull_high"],
+            "color": "deepskyblue", "alpha": 0.15,
+            "label": f"FVG Bull [{struct['fvg_bull_low']:.2f}-{struct['fvg_bull_high']:.2f}]",
+        })
+
+    if struct["fvg_bear_fresh"] and struct["fvg_bear_high"] > 0:
+        markers["rects"].append({
+            "y0": struct["fvg_bear_low"], "y1": struct["fvg_bear_high"],
+            "color": "magenta", "alpha": 0.15,
+            "label": f"FVG Bear [{struct['fvg_bear_low']:.2f}-{struct['fvg_bear_high']:.2f}]",
+        })
+
+    return markers
+
+
+def _plot_validation(bars: List[Dict], struct: Dict, atr: float,
+                      symbol: str, interval: str, regime_mode: str,
+                      save_path: Path) -> None:
+    df = _bars_to_df(bars)
+
+    fig = mpf.figure(figsize=(16, 9), style="charles")
+    ax_main = fig.add_subplot(1, 1, 1)
+
+    markers = _build_markers(struct)
+
+    mpf.plot(
+        df, type="candle", ax=ax_main,
+        style="charles", show_nontrading=False,
+        warn_too_much_data=10000,
+    )
+
+    for level, color, style, label in zip(
+        markers["hlines"], markers["hline_colors"],
+        markers["hline_styles"], markers["hline_labels"],
+    ):
+        ax_main.axhline(y=level, color=color, linestyle=style, linewidth=1.3, alpha=0.85)
+        ax_main.text(
+            len(df) - 1, level, f"  {label}",
+            color=color, fontsize=9, va="center", fontweight="bold",
+        )
+
+    for rect in markers["rects"]:
+        ax_main.axhspan(rect["y0"], rect["y1"], color=rect["color"], alpha=rect["alpha"])
+        mid_y = (rect["y0"] + rect["y1"]) / 2
+        ax_main.text(
+            2, mid_y, rect["label"],
+            color=rect["color"], fontsize=8, va="center", fontweight="bold",
+            bbox=dict(facecolor="white", alpha=0.6, edgecolor="none", pad=1),
+        )
+
+    last_idx = len(df) - 1
+    if struct["bos_bull"]:
+        ax_main.annotate(
+            "BOS BULL ▲", xy=(last_idx, df["High"].iloc[-1]),
+            xytext=(last_idx, df["High"].iloc[-1] * 1.0015),
+            color="lime", fontsize=11, fontweight="bold", ha="center",
+            arrowprops=dict(arrowstyle="->", color="lime"),
+        )
+    if struct["bos_bear"]:
+        ax_main.annotate(
+            "BOS BEAR ▼", xy=(last_idx, df["Low"].iloc[-1]),
+            xytext=(last_idx, df["Low"].iloc[-1] * 0.9985),
+            color="red", fontsize=11, fontweight="bold", ha="center",
+            arrowprops=dict(arrowstyle="->", color="red"),
+        )
+
+    fvg_text = []
+    if struct["fvg_bull_fresh"]:
+        fvg_text.append(f"FVG Bull: FRESH [{struct['fvg_bull_low']:.2f}-{struct['fvg_bull_high']:.2f}] ✅")
+    if struct["fvg_bear_fresh"]:
+        fvg_text.append(f"FVG Bear: FRESH [{struct['fvg_bear_low']:.2f}-{struct['fvg_bear_high']:.2f}] ✅")
+    if not fvg_text:
+        fvg_text.append("FVG: tidak ada gap fresh")
+
+    info_lines = [
+        f"Symbol: {symbol}  |  Interval: {interval}  |  Regime: {regime_mode}",
+        f"ATR({ATR_PERIOD}): {atr:.4f}",
+        f"Swing High: {struct['swing_high']:.2f}   Swing Low: {struct['swing_low']:.2f}",
+        f"BOS Bull: {struct['bos_bull']}   BOS Bear: {struct['bos_bear']}",
+        f"OB Bull Valid: {struct['ob_bull_valid']}   OB Bear Valid: {struct['ob_bear_valid']}",
+        f"Liq Swept L: {struct['liq_swept_l']}   Liq Swept H: {struct['liq_swept_h']}",
+        " | ".join(fvg_text),
+        f"Bias -> D1:{struct['d1_bias']} H4:{struct['h4_bias']} H1:{struct['h1_bias']} "
+        f"M30:{struct['m30_bias']} M15:{struct['m15_bias']} M5:{struct['m5_bias']} M1:{struct['m1_bias']}",
+        f"Vol Surge: {struct['vol_surge']}   ACF Chop: {struct['acf_chop']}   Disp OK: {struct['disp_ok']}",
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+    ]
+    ax_main.text(
+        0.01, 0.99, "\n".join(info_lines),
+        transform=ax_main.transAxes, fontsize=8.5,
+        va="top", ha="left", family="monospace",
+        bbox=dict(facecolor="white", alpha=0.85, edgecolor="gray", pad=6),
+    )
+
+    ax_main.set_title(
+        f"PEMIF Structure Validator — {symbol} ({interval}) — Mode: {regime_mode}",
+        fontsize=13, fontweight="bold",
+    )
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    print(f"✅ Chart tersimpan: {save_path.resolve()}")
+
+    plt.show()
+
+
+def run_validator(
+    symbol: str = SYMBOL, api_key: str = TWELVEDATA_KEY, interval: str = INTERVAL,
+) -> None:
+    """
+    Mode --validate: ambil bar LIVE terbaru dari TwelveData (sumber data SAMA
+    dengan bot live), jalankan StructureEngine, plot candlestick + marker
+    swing/BOS/OB/FVG untuk cross-check manual terhadap TradingView.
+    Read-only: TIDAK mengirim Telegram, TIDAK menulis journal/regime state.
+    """
+    if not PLOT_AVAILABLE:
+        print("❌ Library plotting belum lengkap. Jalankan dulu:")
+        print("   pip install matplotlib mplfinance pandas")
+        sys.exit(1)
+
+    print(f"📡 Mengambil {MIN_BARS_CME + 30} bar terbaru dari TwelveData...")
+    bars = _fetch_bars_rest(
+        symbol=symbol, interval=interval, api_key=api_key,
+        outputsize=MIN_BARS_CME + 30,
+    )
+    print(f"   Diterima: {len(bars)} bar | Range: {bars[0]['datetime']} -> {bars[-1]['datetime']}")
+
+    if len(bars) < MIN_BARS_CME:
+        print(f"❌ Bar tidak cukup ({len(bars)} < {MIN_BARS_CME}). Tidak bisa lanjut.")
+        sys.exit(1)
+
+    atr = calc_atr_rma(bars, ATR_PERIOD)
+    params = _resolve_struct_params(REGIME_INITIAL_MODE)
+    struct = structure_engine.compute(bars, "BUY", atr, params)
+
+    print("\n── Hasil StructureEngine ──")
+    for k in ("swing_high", "swing_low", "bos_bull", "bos_bear",
+              "ob_bull_valid", "ob_bear_valid", "fvg_bull_fresh", "fvg_bear_fresh",
+              "fvg_bull_high", "fvg_bull_low", "fvg_bear_high", "fvg_bear_low",
+              "liq_swept_l", "liq_swept_h", "d1_bias", "h4_bias", "h1_bias",
+              "m30_bias", "m15_bias", "m5_bias", "m1_bias",
+              "vol_surge", "acf_chop", "disp_ok"):
+        print(f"   {k:18s}: {struct[k]}")
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_path = Path(f"pemif_validation_{ts}.png")
+
+    _plot_validation(
+        bars=bars, struct=struct, atr=atr,
+        symbol=symbol, interval=interval, regime_mode=REGIME_INITIAL_MODE,
+        save_path=save_path,
+    )
+
+
+def _quick_diagnostic() -> None:
+    """Mode --diag: cek apakah pipeline StructureEngine mengisi nilai
+    variatif dari bars live (bukan stuck di default False/0/NEU)."""
+    log.info("=== QUICK DIAGNOSTIC START ===")
+    bars = _fetch_bars_rest(SYMBOL, INTERVAL, TWELVEDATA_KEY, MIN_BARS_CME + 10)
+    log.info("Jumlah bar tersedia: %d (minimum butuh: %d)", len(bars), MIN_BARS_CME)
+    if len(bars) < MIN_BARS_CME:
+        log.error("❌ STOP DI SINI: bar < %d. CME/EPS/QCM semua akan return kosong/0.", MIN_BARS_CME)
+        return
+
+    journal  = TradeJournal()
+    adaptive = AdaptiveController(journal, SYMBOL)
+    regime   = RegimeAdaptiveMode(journal, SYMBOL)
+    sig = analyze_both_directions(bars, SYMBOL, adaptive=adaptive, regime=regime)
+
+    log.info("Regime mode      : %s", sig.regime_mode)
+    log.info("ATR current       : %.4f", sig.atr_current)
+    log.info("swing_high/low    : %.2f / %.2f", sig.swing_high, sig.swing_low)
+    log.info("bos_bull/bear     : %s / %s", sig.bos_bull, sig.bos_bear)
+    log.info("ob_bull/bear_valid: %s / %s", sig.ob_bull_valid, sig.ob_bear_valid)
+    log.info("fvg_bull/bear     : %s / %s", sig.fvg_bull_fresh, sig.fvg_bear_fresh)
+    log.info("fvg_bull zone     : %.2f - %.2f", sig.fvg_bull_low, sig.fvg_bull_high)
+    log.info("fvg_bear zone     : %.2f - %.2f", sig.fvg_bear_low, sig.fvg_bear_high)
+    log.info("Bias MTF  d1=%s h4=%s h1=%s m30=%s m15=%s m5=%s m1=%s",
+              sig.d1_bias, sig.h4_bias, sig.h1_bias, sig.m30_bias, sig.m15_bias, sig.m5_bias, sig.m1_bias)
+    log.info("eps_score=%d  qcm_score=%d  cms_score=%.1f", sig.eps_score, sig.qcm_score, sig.cms_score)
+    log.info("in_killzone=%s kz_name=%s", sig.in_killzone, sig.kz_name)
+    log.info("gate_ok=%s  veto_rsn=%s", sig.gate_ok, sig.veto_rsn)
+    log.info("=== QUICK DIAGNOSTIC END ===")
 
 
 # ═══════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ═══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    run_engine(symbol=SYMBOL, api_key=TWELVEDATA_KEY, interval=INTERVAL)
+    if "--validate" in sys.argv:
+        run_validator(symbol=SYMBOL, api_key=TWELVEDATA_KEY, interval=INTERVAL)
+    elif "--diag" in sys.argv:
+        _quick_diagnostic()
+    else:
+        run_engine(symbol=SYMBOL, api_key=TWELVEDATA_KEY, interval=INTERVAL)
